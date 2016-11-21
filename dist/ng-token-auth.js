@@ -1,3 +1,7 @@
+if (typeof module !== 'undefined' && typeof exports !== 'undefined' && module.exports === exports) {
+  module.exports = 'ng-token-auth';
+}
+
 angular.module('ng-token-auth', ['ipCookie']).provider('$auth', function() {
   var configs, defaultConfigName;
   configs = {
@@ -22,14 +26,24 @@ angular.module('ng-token-auth', ['ipCookie']).provider('$auth', function() {
       },
       proxyUrl: '/proxy',
       validateOnPageLoad: true,
-      forceHardRedirect: false,
+      omniauthWindowType: 'sameWindow',
       storage: 'cookies',
+      forceValidateToken: false,
       tokenFormat: {
         "access-token": "{{ token }}",
         "token-type": "Bearer",
         client: "{{ clientId }}",
         expiry: "{{ expiry }}",
         uid: "{{ uid }}"
+      },
+      cookieOps: {
+        path: "/",
+        expires: 9999,
+        expirationUnit: 'days',
+        secure: false
+      },
+      createPopup: function(url) {
+        return window.open(url, '_blank', 'closebuttoncaption=Cancel');
       },
       parseExpiry: function(headers) {
         return (parseInt(headers['expiry'], 10) * 1000) || null;
@@ -81,8 +95,8 @@ angular.module('ng-token-auth', ['ipCookie']).provider('$auth', function() {
       return configs;
     },
     $get: [
-      '$http', '$q', '$location', 'ipCookie', '$window', '$timeout', '$rootScope', '$interpolate', (function(_this) {
-        return function($http, $q, $location, ipCookie, $window, $timeout, $rootScope, $interpolate) {
+      '$http', '$q', '$location', 'ipCookie', '$window', '$timeout', '$rootScope', '$interpolate', '$interval', (function(_this) {
+        return function($http, $q, $location, ipCookie, $window, $timeout, $rootScope, $interpolate, $interval) {
           return {
             header: null,
             dfd: null,
@@ -91,6 +105,7 @@ angular.module('ng-token-auth', ['ipCookie']).provider('$auth', function() {
             listener: null,
             initialize: function() {
               this.initializeListeners();
+              this.cancelOmniauthInAppBrowserListeners = (function() {});
               return this.addScopeMethods();
             },
             initializeListeners: function() {
@@ -100,15 +115,16 @@ angular.module('ng-token-auth', ['ipCookie']).provider('$auth', function() {
               }
             },
             cancel: function(reason) {
-              if (this.t != null) {
-                $timeout.cancel(this.t);
+              if (this.requestCredentialsPollingTimer != null) {
+                $timeout.cancel(this.requestCredentialsPollingTimer);
               }
+              this.cancelOmniauthInAppBrowserListeners();
               if (this.dfd != null) {
                 this.rejectDfd(reason);
               }
               return $timeout(((function(_this) {
                 return function() {
-                  return _this.t = null;
+                  return _this.requestCredentialsPollingTimer = null;
                 };
               })(this)), 0);
             },
@@ -119,11 +135,16 @@ angular.module('ng-token-auth', ['ipCookie']).provider('$auth', function() {
               }
             },
             handlePostMessage: function(ev) {
-              var error;
+              var error, oauthRegistration;
               if (ev.data.message === 'deliverCredentials') {
                 delete ev.data.message;
+                oauthRegistration = ev.data.oauth_registration;
+                delete ev.data.oauth_registration;
                 this.handleValidAuth(ev.data, true);
                 $rootScope.$broadcast('auth:login-success', ev.data);
+                if (oauthRegistration) {
+                  $rootScope.$broadcast('auth:oauth-registration', ev.data);
+                }
               }
               if (ev.data.message === 'authFailure') {
                 error = {
@@ -166,12 +187,15 @@ angular.module('ng-token-auth', ['ipCookie']).provider('$auth', function() {
                 return $rootScope.$broadcast('auth:registration-email-error', resp);
               });
             },
-            submitLogin: function(params, opts) {
+            submitLogin: function(params, opts, httpopts) {
               if (opts == null) {
                 opts = {};
               }
+              if (httpopts == null) {
+                httpopts = {};
+              }
               this.initDfd();
-              $http.post(this.apiUrl(opts.config) + this.getConfig(opts.config).emailSignInPath, params).success((function(_this) {
+              $http.post(this.apiUrl(opts.config) + this.getConfig(opts.config).emailSignInPath, params, httpopts).success((function(_this) {
                 return function(resp) {
                   var authData;
                   _this.setConfigName(opts.config);
@@ -271,57 +295,95 @@ angular.module('ng-token-auth', ['ipCookie']).provider('$auth', function() {
               return this.persistData('currentConfigName', configName, configName);
             },
             openAuthWindow: function(provider, opts) {
-              var authUrl;
-              authUrl = this.buildAuthUrl(provider, opts);
-              if (this.useExternalWindow()) {
-                return this.requestCredentials(this.createPopup(authUrl));
-              } else {
+              var authUrl, omniauthWindowType;
+              omniauthWindowType = this.getConfig(opts.config).omniauthWindowType;
+              authUrl = this.buildAuthUrl(omniauthWindowType, provider, opts);
+              if (omniauthWindowType === 'newWindow') {
+                return this.requestCredentialsViaPostMessage(this.getConfig().createPopup(authUrl));
+              } else if (omniauthWindowType === 'inAppBrowser') {
+                return this.requestCredentialsViaExecuteScript(this.getConfig().createPopup(authUrl));
+              } else if (omniauthWindowType === 'sameWindow') {
                 return this.visitUrl(authUrl);
+              } else {
+                throw 'Unsupported omniauthWindowType "#{omniauthWindowType}"';
               }
             },
             visitUrl: function(url) {
               return $window.location.replace(url);
             },
-            buildAuthUrl: function(provider, opts) {
-              var authUrl, key, val, _ref;
+            buildAuthUrl: function(omniauthWindowType, provider, opts) {
+              var authUrl, key, params, val;
               if (opts == null) {
                 opts = {};
               }
               authUrl = this.getConfig(opts.config).apiUrl;
               authUrl += this.getConfig(opts.config).authProviderPaths[provider];
               authUrl += '?auth_origin_url=' + encodeURIComponent($window.location.href);
-              if (opts.params != null) {
-                _ref = opts.params;
-                for (key in _ref) {
-                  val = _ref[key];
-                  authUrl += '&';
-                  authUrl += encodeURIComponent(key);
-                  authUrl += '=';
-                  authUrl += encodeURIComponent(val);
-                }
+              params = angular.extend({}, opts.params || {}, {
+                omniauth_window_type: omniauthWindowType
+              });
+              for (key in params) {
+                val = params[key];
+                authUrl += '&';
+                authUrl += encodeURIComponent(key);
+                authUrl += '=';
+                authUrl += encodeURIComponent(val);
               }
               return authUrl;
             },
-            requestCredentials: function(authWindow) {
+            requestCredentialsViaPostMessage: function(authWindow) {
               if (authWindow.closed) {
-                this.cancel({
-                  reason: 'unauthorized',
-                  errors: ['User canceled login']
-                });
-                return $rootScope.$broadcast('auth:window-closed');
+                return this.handleAuthWindowClose(authWindow);
               } else {
                 authWindow.postMessage("requestCredentials", "*");
-                return this.t = $timeout(((function(_this) {
+                return this.requestCredentialsPollingTimer = $timeout(((function(_this) {
                   return function() {
-                    return _this.requestCredentials(authWindow);
+                    return _this.requestCredentialsViaPostMessage(authWindow);
                   };
                 })(this)), 500);
               }
             },
-            createPopup: function(url) {
-              return $window.open(url);
+            requestCredentialsViaExecuteScript: function(authWindow) {
+              var handleAuthWindowClose, handleLoadStop;
+              this.cancelOmniauthInAppBrowserListeners();
+              handleAuthWindowClose = this.handleAuthWindowClose.bind(this, authWindow);
+              handleLoadStop = this.handleLoadStop.bind(this, authWindow);
+              authWindow.addEventListener('loadstop', handleLoadStop);
+              authWindow.addEventListener('exit', handleAuthWindowClose);
+              return this.cancelOmniauthInAppBrowserListeners = function() {
+                authWindow.removeEventListener('loadstop', handleLoadStop);
+                return authWindow.removeEventListener('exit', handleAuthWindowClose);
+              };
+            },
+            handleLoadStop: function(authWindow) {
+              _this = this;
+              return authWindow.executeScript({
+                code: 'requestCredentials()'
+              }, function(response) {
+                var data, ev;
+                data = response[0];
+                if (data) {
+                  ev = new Event('message');
+                  ev.data = data;
+                  _this.cancelOmniauthInAppBrowserListeners();
+                  $window.dispatchEvent(ev);
+                  _this.initDfd();
+                  return authWindow.close();
+                }
+              });
+            },
+            handleAuthWindowClose: function(authWindow) {
+              this.cancel({
+                reason: 'unauthorized',
+                errors: ['User canceled login']
+              });
+              this.cancelOmniauthInAppBrowserListeners;
+              return $rootScope.$broadcast('auth:window-closed');
             },
             resolveDfd: function() {
+              if (!this.dfd) {
+                return;
+              }
               this.dfd.resolve(this.user);
               return $timeout(((function(_this) {
                 return function() {
@@ -332,8 +394,38 @@ angular.module('ng-token-auth', ['ipCookie']).provider('$auth', function() {
                 };
               })(this)), 0);
             },
+            buildQueryString: function(param, prefix) {
+              var encoded, k, str, v;
+              str = [];
+              for (k in param) {
+                v = param[k];
+                k = prefix ? prefix + "[" + k + "]" : k;
+                encoded = angular.isObject(v) ? this.buildQueryString(v, k) : k + "=" + encodeURIComponent(v);
+                str.push(encoded);
+              }
+              return str.join("&");
+            },
+            parseLocation: function(location) {
+              var i, locationSubstring, obj, pair, pairs;
+              locationSubstring = location.substring(1);
+              obj = {};
+              if (locationSubstring) {
+                pairs = locationSubstring.split('&');
+                pair = void 0;
+                i = void 0;
+                for (i in pairs) {
+                  i = i;
+                  if ((pairs[i] === '') || (typeof pairs[i] === 'function')) {
+                    continue;
+                  }
+                  pair = pairs[i].split('=');
+                  obj[decodeURIComponent(pair[0])] = decodeURIComponent(pair[1]);
+                }
+              }
+              return obj;
+            },
             validateUser: function(opts) {
-              var clientId, configName, expiry, token, uid;
+              var clientId, configName, expiry, location_parse, params, search, token, uid, url;
               if (opts == null) {
                 opts = {};
               }
@@ -343,26 +435,41 @@ angular.module('ng-token-auth', ['ipCookie']).provider('$auth', function() {
                 if (this.userIsAuthenticated()) {
                   this.resolveDfd();
                 } else {
-                  if ($location.search().token !== void 0) {
-                    token = $location.search().token;
-                    clientId = $location.search().client_id;
-                    uid = $location.search().uid;
-                    expiry = $location.search().expiry;
-                    configName = $location.search().config;
+                  search = $location.search();
+                  location_parse = this.parseLocation(window.location.search);
+                  params = Object.keys(search).length === 0 ? location_parse : search;
+                  token = params.auth_token || params.token;
+                  if (token !== void 0) {
+                    clientId = params.client_id;
+                    uid = params.uid;
+                    expiry = params.expiry;
+                    configName = params.config;
                     this.setConfigName(configName);
-                    this.mustResetPassword = $location.search().reset_password;
-                    this.firstTimeLogin = $location.search().account_confirmation_success;
+                    this.mustResetPassword = params.reset_password;
+                    this.firstTimeLogin = params.account_confirmation_success;
+                    this.oauthRegistration = params.oauth_registration;
                     this.setAuthHeaders(this.buildAuthHeaders({
                       token: token,
                       clientId: clientId,
                       uid: uid,
                       expiry: expiry
                     }));
-                    $location.url($location.path() || '/');
+                    url = $location.path() || '/';
+                    ['auth_token', 'token', 'client_id', 'uid', 'expiry', 'config', 'reset_password', 'account_confirmation_success', 'oauth_registration'].forEach(function(prop) {
+                      return delete params[prop];
+                    });
+                    if (Object.keys(params).length > 0) {
+                      url += '?' + this.buildQueryString(params);
+                    }
+                    $location.url(url);
                   } else if (this.retrieveData('currentConfigName')) {
                     configName = this.retrieveData('currentConfigName');
                   }
-                  if (!isEmpty(this.retrieveData('auth_headers'))) {
+                  if (this.getConfig().forceValidateToken) {
+                    this.validateToken({
+                      config: configName
+                    });
+                  } else if (!isEmpty(this.retrieveData('auth_headers'))) {
                     if (this.tokenHasExpired()) {
                       $rootScope.$broadcast('auth:session-expired');
                       this.rejectDfd({
@@ -398,6 +505,9 @@ angular.module('ng-token-auth', ['ipCookie']).provider('$auth', function() {
                     if (_this.firstTimeLogin) {
                       $rootScope.$broadcast('auth:email-confirmation-success', _this.user);
                     }
+                    if (_this.oauthRegistration) {
+                      $rootScope.$broadcast('auth:oauth-registration', _this.user);
+                    }
                     if (_this.mustResetPassword) {
                       $rootScope.$broadcast('auth:password-reset-confirm-success', _this.user);
                     }
@@ -414,7 +524,7 @@ angular.module('ng-token-auth', ['ipCookie']).provider('$auth', function() {
                     $rootScope.$broadcast('auth:validation-error', data);
                     return _this.rejectDfd({
                       reason: 'unauthorized',
-                      errors: data.errors
+                      errors: data != null ? data.errors : ['Unspecified error']
                     });
                   };
                 })(this));
@@ -442,6 +552,9 @@ angular.module('ng-token-auth', ['ipCookie']).provider('$auth', function() {
                 delete this.user[key];
               }
               this.deleteData('currentConfigName');
+              if (this.timer != null) {
+                $interval.cancel(this.timer);
+              }
               return this.deleteData('auth_headers');
             },
             signOut: function() {
@@ -461,9 +574,10 @@ angular.module('ng-token-auth', ['ipCookie']).provider('$auth', function() {
               if (setHeader == null) {
                 setHeader = false;
               }
-              if (this.t != null) {
-                $timeout.cancel(this.t);
+              if (this.requestCredentialsPollingTimer != null) {
+                $timeout.cancel(this.requestCredentialsPollingTimer);
               }
+              this.cancelOmniauthInAppBrowserListeners();
               angular.extend(this.user, user);
               this.user.signedIn = true;
               this.user.configName = this.getCurrentConfigName();
@@ -488,40 +602,77 @@ angular.module('ng-token-auth', ['ipCookie']).provider('$auth', function() {
               return headers;
             },
             persistData: function(key, val, configName) {
-              switch (this.getConfig(configName).storage) {
-                case 'localStorage':
-                  return $window.localStorage.setItem(key, JSON.stringify(val));
-                default:
-                  return ipCookie(key, val, {
-                    path: '/'
-                  });
+              if (this.getConfig(configName).storage instanceof Object) {
+                return this.getConfig(configName).storage.persistData(key, val, this.getConfig(configName));
+              } else {
+                switch (this.getConfig(configName).storage) {
+                  case 'localStorage':
+                    return $window.localStorage.setItem(key, JSON.stringify(val));
+                  case 'sessionStorage':
+                    return $window.sessionStorage.setItem(key, JSON.stringify(val));
+                  default:
+                    return ipCookie(key, val, this.getConfig().cookieOps);
+                }
               }
             },
             retrieveData: function(key) {
-              switch (this.getConfig().storage) {
-                case 'localStorage':
-                  return JSON.parse($window.localStorage.getItem(key));
-                default:
-                  return ipCookie(key);
+              var e;
+              try {
+                if (this.getConfig().storage instanceof Object) {
+                  return this.getConfig().storage.retrieveData(key);
+                } else {
+                  switch (this.getConfig().storage) {
+                    case 'localStorage':
+                      return JSON.parse($window.localStorage.getItem(key));
+                    case 'sessionStorage':
+                      return JSON.parse($window.sessionStorage.getItem(key));
+                    default:
+                      return ipCookie(key);
+                  }
+                }
+              } catch (_error) {
+                e = _error;
+                if (e instanceof SyntaxError) {
+                  return void 0;
+                } else {
+                  throw e;
+                }
               }
             },
             deleteData: function(key) {
+              if (this.getConfig().storage instanceof Object) {
+                this.getConfig().storage.deleteData(key);
+              }
               switch (this.getConfig().storage) {
                 case 'localStorage':
                   return $window.localStorage.removeItem(key);
+                case 'sessionStorage':
+                  return $window.sessionStorage.removeItem(key);
                 default:
                   return ipCookie.remove(key, {
-                    path: '/'
+                    path: this.getConfig().cookieOps.path
                   });
               }
             },
             setAuthHeaders: function(h) {
-              var newHeaders;
+              var expiry, newHeaders, now, result;
               newHeaders = angular.extend(this.retrieveData('auth_headers') || {}, h);
-              return this.persistData('auth_headers', newHeaders);
-            },
-            useExternalWindow: function() {
-              return !(this.getConfig().forceHardRedirect || $window.isIE());
+              result = this.persistData('auth_headers', newHeaders);
+              expiry = this.getExpiry();
+              now = new Date().getTime();
+              if (expiry > now) {
+                if (this.timer != null) {
+                  $interval.cancel(this.timer);
+                }
+                this.timer = $interval(((function(_this) {
+                  return function() {
+                    return _this.validateUser({
+                      config: _this.getSavedConfig()
+                    });
+                  };
+                })(this)), parseInt(expiry - now), 1);
+              }
+              return result;
             },
             initDfd: function() {
               return this.dfd = $q.defer();
@@ -561,15 +712,47 @@ angular.module('ng-token-auth', ['ipCookie']).provider('$auth', function() {
               var c, key;
               c = void 0;
               key = 'currentConfigName';
-              if ($window.localStorage) {
+              if (this.hasLocalStorage()) {
                 if (c == null) {
                   c = JSON.parse($window.localStorage.getItem(key));
+                }
+              } else if (this.hasSessionStorage()) {
+                if (c == null) {
+                  c = JSON.parse($window.sessionStorage.getItem(key));
                 }
               }
               if (c == null) {
                 c = ipCookie(key);
               }
               return c || defaultConfigName;
+            },
+            hasSessionStorage: function() {
+              var error;
+              if (this._hasSessionStorage == null) {
+                this._hasSessionStorage = false;
+                try {
+                  $window.sessionStorage.setItem('ng-token-auth-test', 'ng-token-auth-test');
+                  $window.sessionStorage.removeItem('ng-token-auth-test');
+                  this._hasSessionStorage = true;
+                } catch (_error) {
+                  error = _error;
+                }
+              }
+              return this._hasSessionStorage;
+            },
+            hasLocalStorage: function() {
+              var error;
+              if (this._hasLocalStorage == null) {
+                this._hasLocalStorage = false;
+                try {
+                  $window.localStorage.setItem('ng-token-auth-test', 'ng-token-auth-test');
+                  $window.localStorage.removeItem('ng-token-auth-test');
+                  this._hasLocalStorage = true;
+                } catch (_error) {
+                  error = _error;
+                }
+              }
+              return this._hasLocalStorage;
             }
           };
         };
@@ -648,7 +831,7 @@ angular.module('ng-token-auth', ['ipCookie']).provider('$auth', function() {
       if ((_base = $httpProvider.defaults.headers)[method] == null) {
         _base[method] = {};
       }
-      return $httpProvider.defaults.headers[method]['If-Modified-Since'] = '0';
+      return $httpProvider.defaults.headers[method]['If-Modified-Since'] = 'Mon, 26 Jul 1997 05:00:00 GMT';
     });
   }
 ]).run([
